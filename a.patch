@@ -1,0 +1,1956 @@
+commit 1e47627c350451039b1fc801186365320a50409f
+Author: Paweł Gronowski <pawel.gronowski@docker.com>
+Date:   Wed Aug 12 19:05:19 2026 +0200
+
+    extensions: Add transport-neutral published services
+    
+    Socket-exposed APIs previously required extension authors and clients
+    to use gRPC registration and generated protobuf clients directly.
+    
+    Add typed service definitions generated from handwritten Go contracts.
+    The SDK and daemon adapt them to the existing gRPC transport
+    internally, while clients resolve the same handwritten interface
+    through an Engine connection. Keep servicegrpcv0 as the raw gRPC
+    escape hatch.
+    
+    Signed-off-by: Paweł Gronowski <pawel.gronowski@docker.com>
+
+diff --git daemon/extensions.go daemon/extensions.go
+index cb525089d5..7c01785a0e 100644
+--- daemon/extensions.go
++++ daemon/extensions.go
+@@ -8,11 +8,13 @@
+ 	"github.com/containerd/log"
+ 	"github.com/moby/moby/v2/daemon/config"
+ 	"github.com/moby/moby/v2/daemon/internal/rootless"
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
+ 	servicegrpcv0 "github.com/moby/moby/v2/extpoints/servicegrpc/v0"
+ 	"github.com/moby/moby/v2/internal/extensions"
+ 	"github.com/moby/moby/v2/internal/extensions/grpcproxy"
+ 	"github.com/moby/moby/v2/internal/extensions/host"
+ 	"github.com/moby/moby/v2/internal/extensions/serverpoint"
++	"github.com/moby/moby/v2/internal/extensions/servicegrpc"
+ 	"github.com/moby/moby/v2/pkg/homedir"
+ 	"google.golang.org/grpc"
+ )
+@@ -26,7 +28,7 @@ func setupExtensionHost(ctx context.Context, cfg *config.Config) (*host.Host, er
+ 		ClientProviders:     clientProviders(),
+ 		DependencyProviders: dependencyProviders(),
+ 		ExtensionConfig:     extensionConfig(cfg),
+-		ExposeOnlyPoints:    []extensions.PointID{servicegrpcv0.Point.ID()},
++		ExposeOnlyPoints:    []extensions.PointID{servicev0.Point.ID(), servicegrpcv0.Point.ID()},
+ 	})
+ }
+ 
+@@ -79,9 +81,9 @@ func defaultExtensionDir() (string, error) {
+ 	return filepath.Join(libexecDir, "docker", "moby-extensions"), nil
+ }
+ 
+-// ExposeExtensionServices publishes services selected through service.grpc on
+-// the API socket. In-process services are registered on gs; out-of-process
+-// services are proxied by name. Service-name collisions fail startup.
++// ExposeExtensionServices publishes typed and raw extension services on the API
++// socket. In-process services are registered on gs; out-of-process services are
++// proxied by name. Service-name collisions fail startup.
+ func (daemon *Daemon) ExposeExtensionServices(gs *grpc.Server) (*grpcproxy.Proxy, error) {
+ 	if daemon.extensionHost == nil {
+ 		return nil, nil
+@@ -91,10 +93,21 @@ func (daemon *Daemon) ExposeExtensionServices(gs *grpc.Server) (*grpcproxy.Proxy
+ 		reserved[name] = struct{}{}
+ 	}
+ 
+-	inproc, err := servicegrpcv0.Collect(daemon.extensionHost)
++	typed, err := servicev0.Collect(daemon.extensionHost)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	var inproc []servicegrpc.Service
++	for _, registration := range typed {
++		inproc = append(inproc, servicegrpc.Adapt(registration))
++	}
++	raw, err := servicegrpcv0.Collect(daemon.extensionHost)
++	if err != nil {
++		return nil, err
++	}
++	for _, svc := range raw {
++		inproc = append(inproc, servicegrpc.Service{Name: svc.Name, Desc: svc.Desc, Impl: svc.Impl})
++	}
+ 	for _, svc := range inproc {
+ 		if _, taken := reserved[svc.Name]; taken {
+ 			return nil, fmt.Errorf("in-process extension cannot expose gRPC service %q: it is already served", svc.Name)
+@@ -106,7 +119,16 @@ func (daemon *Daemon) ExposeExtensionServices(gs *grpc.Server) (*grpcproxy.Proxy
+ 	}
+ 
+ 	var backends []grpcproxy.Backend
+-	for ext, names := range daemon.extensionHost.ServicesForPoint(servicegrpcv0.Point.ID()) {
++	typedServices := daemon.extensionHost.ServicesForPoint(servicev0.Point.ID())
++	rawServices := daemon.extensionHost.ServicesForPoint(servicegrpcv0.Point.ID())
++	backendServices := make(map[extensions.ExtensionID][]string, len(typedServices)+len(rawServices))
++	for ext, names := range typedServices {
++		backendServices[ext] = append(backendServices[ext], names...)
++	}
++	for ext, names := range rawServices {
++		backendServices[ext] = append(backendServices[ext], names...)
++	}
++	for ext, names := range backendServices {
+ 		if conn, ok := daemon.extensionHost.Conn(ext); ok {
+ 			backends = append(backends, grpcproxy.Backend{ID: string(ext), Conn: conn, Services: names})
+ 		}
+diff --git extensions/client/client.go extensions/client/client.go
+new file mode 100644
+index 0000000000..4481c41e53
+--- /dev/null
++++ extensions/client/client.go
+@@ -0,0 +1,64 @@
++// Package extensionclient resolves typed extension services published on the
++// Engine API connection.
++package extensionclient
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++
++	engineclient "github.com/moby/moby/client"
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
++	"github.com/moby/moby/v2/internal/extensions/servicegrpc"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++)
++
++// Client owns one reusable extension RPC connection.
++type Client struct {
++	conn *grpc.ClientConn
++}
++
++// New derives an extension RPC connection from engine's public dialer.
++// It supports local Unix sockets and Windows named pipes.
++func New(engine *engineclient.Client) (*Client, error) {
++	if engine == nil {
++		return nil, errors.New("extension client: engine client is nil")
++	}
++	host, err := engineclient.ParseHostURL(engine.DaemonHost())
++	if err != nil {
++		return nil, fmt.Errorf("extension client: parse engine host: %w", err)
++	}
++	if host.Scheme != "unix" && host.Scheme != "npipe" {
++		return nil, fmt.Errorf("extension client: unsupported engine host scheme %q", host.Scheme)
++	}
++	dialer := engine.Dialer()
++	conn, err := grpc.NewClient("passthrough:///moby-engine",
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
++			return dialer(ctx)
++		}),
++	)
++	if err != nil {
++		return nil, fmt.Errorf("extension client: create connection: %w", err)
++	}
++	return &Client{conn: conn}, nil
++}
++
++// Close closes only the extension RPC connection.
++func (c *Client) Close() error {
++	if c == nil || c.conn == nil {
++		return nil
++	}
++	return c.conn.Close()
++}
++
++// Resolve constructs the handwritten service interface over c's shared
++// connection.
++func Resolve[T any](c *Client, service servicev0.Definition[T]) T {
++	if c == nil || c.conn == nil {
++		panic("extension client: nil client")
++	}
++	return service.NewClient(servicegrpc.NewInvoker(c.conn))
++}
+diff --git extensions/client/client_test.go extensions/client/client_test.go
+new file mode 100644
+index 0000000000..f260f65a38
+--- /dev/null
++++ extensions/client/client_test.go
+@@ -0,0 +1,69 @@
++package extensionclient
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	engineclient "github.com/moby/moby/client"
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
++	"gotest.tools/v3/assert"
++)
++
++func TestNewRejectsNilEngineClient(t *testing.T) {
++	client, err := New(nil)
++	assert.Assert(t, client == nil)
++	assert.ErrorContains(t, err, "engine client is nil")
++}
++
++func TestNewRejectsRemoteEngineHost(t *testing.T) {
++	engine, err := engineclient.New(engineclient.WithHost("tcp://127.0.0.1:2375"))
++	assert.NilError(t, err)
++	defer engine.Close()
++
++	client, err := New(engine)
++	assert.Assert(t, client == nil)
++	assert.ErrorContains(t, err, `unsupported engine host scheme "tcp"`)
++}
++
++func TestNilClientClose(t *testing.T) {
++	var client *Client
++	assert.NilError(t, client.Close())
++}
++
++func TestNewReusesOneConnectionForResolvedServices(t *testing.T) {
++	clientConn, serverConn := net.Pipe()
++	defer serverConn.Close()
++	var dials atomic.Int32
++	dialed := make(chan struct{})
++	engine, err := engineclient.New(engineclient.WithDialContext(func(context.Context, string, string) (net.Conn, error) {
++		if dials.Add(1) == 1 {
++			close(dialed)
++		}
++		return clientConn, nil
++	}))
++	assert.NilError(t, err)
++	defer engine.Close()
++	rpc, err := New(engine)
++	assert.NilError(t, err)
++	defer rpc.Close()
++
++	definition := servicev0.Define("example.Service", func(servicev0.Registrar, serviceMarker) {}, func(servicev0.Invoker) serviceMarker { return serviceMarker{} })
++	Resolve(rpc, definition)
++	Resolve(rpc, definition)
++	assert.Equal(t, dials.Load(), int32(0), "grpc connects lazily")
++
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	rpc.conn.Connect()
++	select {
++	case <-dialed:
++	case <-ctx.Done():
++		t.Fatal("timed out waiting for connection dial")
++	}
++	assert.Equal(t, dials.Load(), int32(1))
++}
++
++type serviceMarker struct{}
+diff --git extpoints/service/v0/service.go extpoints/service/v0/service.go
+new file mode 100644
+index 0000000000..fb291bb932
+--- /dev/null
++++ extpoints/service/v0/service.go
+@@ -0,0 +1,113 @@
++// Package servicev0 defines transport-neutral typed services that extensions
++// publish on the daemon API socket.
++package servicev0
++
++import (
++	"context"
++	"fmt"
++
++	"github.com/moby/moby/v2/internal/extensions"
++)
++
++// Point is the infrastructure point used for typed published services.
++var Point = extensions.DefinePoint[Provider]("org.mobyproject.extension.service.v0")
++
++// Invoker performs one unary call on a named service method.
++type Invoker interface {
++	Invoke(ctx context.Context, service, method string, request, response any) error
++}
++
++// UnaryHandler handles one unary request.
++type UnaryHandler func(ctx context.Context, request any) (any, error)
++
++// Method describes one unary service method and constructs its request value.
++type Method struct {
++	Name       string
++	NewRequest func() any
++	Handler    UnaryHandler
++}
++
++// Registration is a transport-neutral registered service implementation.
++type Registration struct {
++	Service string
++	Methods []Method
++}
++
++// Registrar accepts a transport-neutral service registration.
++type Registrar interface {
++	RegisterService(Registration)
++}
++
++// Definition binds a stable service identity to generated server and client
++// adapters for handwritten interface T.
++type Definition[T any] struct {
++	service  string
++	register func(Registrar, T)
++	client   func(Invoker) T
++}
++
++// Define creates a typed service definition.
++func Define[T any](service string, register func(Registrar, T), client func(Invoker) T) Definition[T] {
++	if service == "" || register == nil || client == nil {
++		panic("servicev0: incomplete service definition")
++	}
++	return Definition[T]{service: service, register: register, client: client}
++}
++
++// Expose declares impl as a typed service published through Point.
++func (d Definition[T]) Expose(impl T) extensions.Provider {
++	if d.service == "" || d.register == nil || d.client == nil {
++		panic("servicev0: incomplete service definition")
++	}
++	return Point.Provide(provider{
++		register: func(registrar Registrar) {
++			d.register(registrar, impl)
++		},
++	})
++}
++
++// NewClient constructs the handwritten service interface over invoker.
++func (d Definition[T]) NewClient(invoker Invoker) T {
++	if d.service == "" || d.register == nil || d.client == nil {
++		panic("servicev0: incomplete service definition")
++	}
++	if invoker == nil {
++		panic(fmt.Sprintf("servicev0: nil invoker for service %q", d.service))
++	}
++	return d.client(invoker)
++}
++
++// Collect gathers typed service registrations without binding a transport.
++func Collect(resolver extensions.Resolver) ([]Registration, error) {
++	providers, err := Point.All(resolver)
++	if err != nil {
++		return nil, err
++	}
++	var registrations collector
++	for _, provider := range providers {
++		provider.Impl.RegisterServices(&registrations)
++	}
++	return registrations.services, nil
++}
++
++// Provider is a typed service implementation published through Point.
++type Provider interface {
++	// RegisterServices registers the provider's typed services.
++	RegisterServices(Registrar)
++}
++
++type provider struct {
++	register func(Registrar)
++}
++
++func (p provider) RegisterServices(registrar Registrar) {
++	p.register(registrar)
++}
++
++type collector struct {
++	services []Registration
++}
++
++func (c *collector) RegisterService(registration Registration) {
++	c.services = append(c.services, registration)
++}
+diff --git extpoints/service/v0/service_test.go extpoints/service/v0/service_test.go
+new file mode 100644
+index 0000000000..2db891b862
+--- /dev/null
++++ extpoints/service/v0/service_test.go
+@@ -0,0 +1,94 @@
++package servicev0
++
++import (
++	"context"
++	"testing"
++
++	"github.com/moby/moby/v2/internal/extensions"
++	"gotest.tools/v3/assert"
++	is "gotest.tools/v3/assert/cmp"
++)
++
++type greeting interface {
++	Greet(context.Context, *request) (*response, error)
++}
++
++type request struct{ name string }
++type response struct{ message string }
++
++type greeter struct{}
++
++func (greeter) Greet(_ context.Context, req *request) (*response, error) {
++	return &response{message: "hello " + req.name}, nil
++}
++
++type greetingClient struct{ invoker Invoker }
++
++func (c greetingClient) Greet(ctx context.Context, req *request) (*response, error) {
++	out := new(response)
++	if err := c.invoker.Invoke(ctx, "example.Greeter", "Greet", req, out); err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++var greetingService = Define("example.Greeter", func(r Registrar, impl greeting) {
++	r.RegisterService(Registration{Service: "example.Greeter", Methods: []Method{{
++		Name: "Greet", NewRequest: func() any { return new(request) },
++		Handler: func(ctx context.Context, req any) (any, error) {
++			return impl.Greet(ctx, req.(*request))
++		},
++	}}})
++}, func(invoker Invoker) greeting { return greetingClient{invoker: invoker} })
++
++func TestDefinitionExposeAndCollect(t *testing.T) {
++	provider := greetingService.Expose(greeter{})
++	resolver := staticResolver{providers: []extensions.ResolvedProvider{{
++		Extension: "example.greeter.v1",
++		Impl:      provider.Impl,
++	}}}
++
++	services, err := Collect(resolver)
++	assert.NilError(t, err)
++	assert.Check(t, is.Len(services, 1))
++	assert.Equal(t, services[0].Service, "example.Greeter")
++	assert.Check(t, is.Len(services[0].Methods, 1))
++	assert.Equal(t, services[0].Methods[0].Name, "Greet")
++
++	got, err := services[0].Methods[0].Handler(context.Background(), &request{name: "world"})
++	assert.NilError(t, err)
++	assert.Equal(t, got.(*response).message, "hello world")
++}
++
++type staticResolver struct {
++	providers []extensions.ResolvedProvider
++}
++
++func (r staticResolver) Provider(extensions.PointID, extensions.ExtensionID) (any, error) {
++	return r.providers[0].Impl, nil
++}
++
++func (r staticResolver) Providers(extensions.PointID) []extensions.ResolvedProvider {
++	return r.providers
++}
++
++func TestDefinitionNewClient(t *testing.T) {
++	invoker := &testInvoker{}
++	client := greetingService.NewClient(invoker)
++	got, err := client.Greet(context.Background(), &request{name: "world"})
++	assert.NilError(t, err)
++	assert.Equal(t, got.message, "hello world")
++	assert.Equal(t, invoker.service, "example.Greeter")
++	assert.Equal(t, invoker.method, "Greet")
++}
++
++type testInvoker struct {
++	service string
++	method  string
++}
++
++func (i *testInvoker) Invoke(_ context.Context, service, method string, req, resp any) error {
++	i.service, i.method = service, method
++	resp.(*response).message = "hello " + req.(*request).name
++	return nil
++}
+diff --git integration/extension/socket_test.go integration/extension/socket_test.go
+index ca3961267d..1a145c0cbc 100644
+--- integration/extension/socket_test.go
++++ integration/extension/socket_test.go
+@@ -9,17 +9,17 @@
+ 	"strconv"
+ 	"testing"
+ 
++	extensionclient "github.com/moby/moby/v2/extensions/client"
+ 	"github.com/moby/moby/v2/integration/extension/testdata/greeter"
++	greeterv0 "github.com/moby/moby/v2/internal/extensions/example/greeter/v0"
+ 	greeterpb "github.com/moby/moby/v2/internal/extensions/example/greeter/v0/protogen"
+ 	"github.com/moby/moby/v2/internal/testutil"
+ 	"github.com/moby/moby/v2/internal/testutil/daemon"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/credentials/insecure"
+ 	"gotest.tools/v3/assert"
+ 	"gotest.tools/v3/skip"
+ )
+ 
+-func TestSocketExposedGRPCService(t *testing.T) {
++func TestSocketExposedTypedService(t *testing.T) {
+ 	skip.If(t, testEnv.IsRemoteDaemon, "the extension binary must be on the daemon's host")
+ 
+ 	ctx := testutil.StartSpan(baseContext, t)
+@@ -34,13 +34,15 @@ func TestSocketExposedGRPCService(t *testing.T) {
+ 	d.Start(t, startArgs...)
+ 	defer d.Stop(t)
+ 
+-	conn, err := grpc.NewClient(d.Sock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
++	engine := d.NewClientT(t)
++	extClient, err := extensionclient.New(engine)
+ 	assert.NilError(t, err)
+-	defer conn.Close()
++	defer extClient.Close()
+ 
+-	resp, err := greeterpb.NewGreeterClient(conn).Greet(ctx, &greeterpb.HelloRequest{Name: "world"})
++	client := extensionclient.Resolve(extClient, greeterpb.Service)
++	resp, err := client.Greet(ctx, &greeterv0.HelloRequest{Name: "world"})
+ 	assert.NilError(t, err)
+-	assert.Equal(t, resp.GetMessage(), "hello world")
++	assert.Equal(t, resp.Message, "hello world")
+ }
+ 
+ func buildGreeterExtension(ctx context.Context, t *testing.T) string {
+diff --git integration/extension/testdata/greeter/cmd/greeter/main.go integration/extension/testdata/greeter/cmd/greeter/main.go
+index 99c863911f..dfea57a22e 100644
+--- integration/extension/testdata/greeter/cmd/greeter/main.go
++++ integration/extension/testdata/greeter/cmd/greeter/main.go
+@@ -3,11 +3,10 @@
+ package main
+ 
+ import (
+-	servicegrpcv0 "github.com/moby/moby/v2/extpoints/servicegrpc/v0"
+ 	"github.com/moby/moby/v2/integration/extension/testdata/greeter"
+ 	"github.com/moby/moby/v2/internal/extensions/sdk"
+ )
+ 
+ func main() {
+-	sdk.Main(greeter.Extension, servicegrpcv0.ServerPoint)
++	sdk.Main(greeter.Extension)
+ }
+diff --git integration/extension/testdata/greeter/greeter.go integration/extension/testdata/greeter/greeter.go
+index 6bf5eafaeb..88dff012f2 100644
+--- integration/extension/testdata/greeter/greeter.go
++++ integration/extension/testdata/greeter/greeter.go
+@@ -4,11 +4,9 @@
+ import (
+ 	"context"
+ 
+-	servicegrpcv0 "github.com/moby/moby/v2/extpoints/servicegrpc/v0"
+ 	"github.com/moby/moby/v2/internal/extensions"
+ 	greeterv0 "github.com/moby/moby/v2/internal/extensions/example/greeter/v0"
+ 	greeterpb "github.com/moby/moby/v2/internal/extensions/example/greeter/v0/protogen"
+-	"google.golang.org/grpc"
+ )
+ 
+ // ID is the extension id and binary name.
+@@ -20,15 +18,8 @@ func (greeter) Greet(_ context.Context, req *greeterv0.HelloRequest) (*greeterv0
+ 	return &greeterv0.HelloReply{Message: "hello " + req.Name}, nil
+ }
+ 
+-// expose registers the greeter gRPC service for socket exposure.
+-type expose struct{}
+-
+-func (expose) RegisterServices(r grpc.ServiceRegistrar) {
+-	greeterpb.ServerPoint.Register(r, greeter{})
+-}
+-
+-// Extension implements the service.grpc point.
++// Extension publishes the typed Greeter service.
+ var Extension = extensions.New(extensions.Declaration{
+ 	ID:        ID,
+-	Providers: []extensions.Provider{servicegrpcv0.Point.Provide(expose{})},
++	Providers: []extensions.Provider{greeterpb.Service.Expose(greeter{})},
+ })
+diff --git integration/extension/testdata/greeterdep/cmd/greeterdep/main.go integration/extension/testdata/greeterdep/cmd/greeterdep/main.go
+index 3c5d7d4c4a..d109e5fde8 100644
+--- integration/extension/testdata/greeterdep/cmd/greeterdep/main.go
++++ integration/extension/testdata/greeterdep/cmd/greeterdep/main.go
+@@ -10,7 +10,7 @@
+ 	"syscall"
+ 
+ 	"github.com/moby/moby/v2/integration/extension/testdata/greeterdep"
+-	greeterpb "github.com/moby/moby/v2/internal/extensions/example/greeter/v0/protogen"
++	greeterpointpb "github.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0/protogen"
+ 	"github.com/moby/moby/v2/internal/extensions/sdk"
+ )
+ 
+@@ -23,7 +23,7 @@ func main() {
+ 		fmt.Fprintln(os.Stderr, err)
+ 		os.Exit(1)
+ 	}
+-	srv.Depends(greeterpb.ClientPoint)
++	srv.Depends(greeterpointpb.ClientPoint)
+ 	if err := srv.Listen(ctx); err != nil {
+ 		fmt.Fprintln(os.Stderr, err)
+ 		os.Exit(1)
+diff --git integration/extension/testdata/greeterdep/greeterdep.go integration/extension/testdata/greeterdep/greeterdep.go
+index d029b1eaff..3c70409c95 100644
+--- integration/extension/testdata/greeterdep/greeterdep.go
++++ integration/extension/testdata/greeterdep/greeterdep.go
+@@ -6,7 +6,7 @@
+ 	"fmt"
+ 
+ 	"github.com/moby/moby/v2/internal/extensions"
+-	greeterv0 "github.com/moby/moby/v2/internal/extensions/example/greeter/v0"
++	greeterpointv0 "github.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0"
+ )
+ 
+ // ID is the extension id and binary name.
+@@ -14,7 +14,7 @@
+ 
+ // initialize calls the greeter dependency and verifies the reply.
+ func initialize(ctx context.Context, _ extensions.Config, r extensions.Resolver) error {
+-	reply, err := greeterv0.Greet(ctx, r, &greeterv0.HelloRequest{Name: "dep"})
++	reply, err := greeterpointv0.Greet(ctx, r, &greeterpointv0.HelloRequest{Name: "dep"})
+ 	if err != nil {
+ 		return fmt.Errorf("greeterdep: call greeter dependency: %w", err)
+ 	}
+@@ -27,6 +27,6 @@ func initialize(ctx context.Context, _ extensions.Config, r extensions.Resolver)
+ // Extension declares and uses a dependency on the greeter point.
+ var Extension = extensions.New(extensions.Declaration{
+ 	ID:           ID,
+-	Dependencies: []extensions.Dependency{greeterv0.Point.Dependency()},
++	Dependencies: []extensions.Dependency{greeterpointv0.Point.Dependency()},
+ 	Init:         initialize,
+ })
+diff --git internal/extensions/cmd/mobyextgen/main.go internal/extensions/cmd/mobyextgen/main.go
+index 27777dbf68..2ac34ca9d0 100644
+--- internal/extensions/cmd/mobyextgen/main.go
++++ internal/extensions/cmd/mobyextgen/main.go
+@@ -1,5 +1,5 @@
+-// Command mobyextgen generates an extension point's wire contract and transport
+-// code from a Go interface and pb-tagged message structs.
++// Command mobyextgen generates an extension point or service's wire contract
++// and transport code from a Go interface and pb-tagged message structs.
+ //
+ // Run with no arguments from the point's package, typically through `go generate`.
+ //
+@@ -135,6 +135,7 @@ type point struct {
+ 	iface      string // Go service interface name
+ 	isPoint    bool   // whether the contract declares an extensions.Point
+ 	isSingle   bool   // whether the point was declared with DefineSinglePoint
++	published  bool   // whether a non-point service is published on the API socket
+ 	methods    []method
+ 	messages   []message
+ }
+@@ -212,7 +213,11 @@ func parsePoint(dir string) (point, error) {
+ 	pt.service = svc.service
+ 	if svc.iface != "" {
+ 		pt.iface, pt.id = svc.iface, svc.pkg
++		pt.published = svc.published
+ 	} else {
++		if svc.published {
++			return point{}, errors.New("mobyextgen:publish is only valid on a non-point service interface")
++		}
+ 		iface, id, single, err := findDefinePoint(files)
+ 		if err != nil {
+ 			return point{}, err
+@@ -282,8 +287,9 @@ func findDefinePoint(files []*ast.File) (iface, id string, single bool, err erro
+ 	return iface, id, single, nil
+ }
+ 
+-// servicePragma declares a contract's gRPC service name, and reservedPragma
+-// preserves a removed field number.
++// servicePragma declares a contract's wire service name, publishPragma opts a
++// non-point interface into typed publication, and reservedPragma preserves a
++// removed field number.
+ //
+ //	//mobyextgen:service=CreateSpecHook
+ //	var Point = extensions.DefinePoint[Hook]("...create_spec.v0")
+@@ -292,15 +298,17 @@ func findDefinePoint(files []*ast.File) (iface, id string, single bool, err erro
+ //	type PointDeclaration struct{ ... }
+ const (
+ 	servicePragma  = "//mobyextgen:service="
++	publishPragma  = "//mobyextgen:publish"
+ 	reservedPragma = "//mobyextgen:reserved="
+ )
+ 
+ // serviceDecl is the service pragma result. Point mode supplies only service;
+ // service mode supplies the interface and fully-qualified proto package too.
+ type serviceDecl struct {
+-	service string
+-	iface   string
+-	pkg     string
++	service   string
++	iface     string
++	pkg       string
++	published bool
+ }
+ 
+ // findServicePragma returns the declared gRPC service. The name is required in
+@@ -318,6 +326,9 @@ func findServicePragma(files []*ast.File) (serviceDecl, error) {
+ 			for _, spec := range gd.Specs {
+ 				values := declPragmas(gd, spec, servicePragma)
+ 				if len(values) == 0 {
++					if len(declPragmas(gd, spec, publishPragma)) > 0 {
++						return serviceDecl{}, errors.New("mobyextgen:publish requires a mobyextgen:service pragma on the same interface")
++					}
+ 					continue
+ 				}
+ 				for _, value := range values {
+@@ -330,17 +341,18 @@ func findServicePragma(files []*ast.File) (serviceDecl, error) {
+ 
+ 				ts, isType := spec.(*ast.TypeSpec)
+ 				if !isType {
+-					found = serviceDecl{service: value}
++					found = serviceDecl{service: value, published: len(declPragmas(gd, spec, publishPragma)) > 0}
+ 					continue
+ 				}
+ 				if _, isIface := ts.Type.(*ast.InterfaceType); !isIface {
+ 					return serviceDecl{}, fmt.Errorf("%s on %s: the pragma may only document an interface or the point", servicePragma, ts.Name.Name)
+ 				}
++				published := len(declPragmas(gd, spec, publishPragma)) > 0
+ 				pkg, service, ok := strings.Cut(reverse(value), ".")
+ 				if !ok {
+ 					return serviceDecl{}, fmt.Errorf("%s on interface %s: want a fully-qualified name like my.proto.package.%s", servicePragma, ts.Name.Name, ts.Name.Name)
+ 				}
+-				found = serviceDecl{service: reverse(pkg), iface: ts.Name.Name, pkg: reverse(service)}
++				found = serviceDecl{service: reverse(pkg), iface: ts.Name.Name, pkg: reverse(service), published: published}
+ 			}
+ 		}
+ 	}
+@@ -696,14 +708,19 @@ func emitWire(pt point) ([]byte, error) {
+ 		fmt.Fprintln(&b, `	clientpoint "github.com/moby/moby/v2/internal/extensions/clientpoint"`)
+ 		fmt.Fprintln(&b, `	serverpoint "github.com/moby/moby/v2/internal/extensions/serverpoint"`)
+ 	}
++	if pt.published {
++		fmt.Fprintln(&b, `	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"`)
++	}
+ 	fmt.Fprintf(&b, "	%s %q\n", cpkg, pt.importPath)
+ 	fmt.Fprintln(&b, `	grpc "google.golang.org/grpc"`)
+ 	fmt.Fprintln(&b, ")")
+ 
+-	fmt.Fprintf(&b, `
+-// serviceName is the point's fully-qualified gRPC service name.
+-const serviceName = %q
+-`, pt.grpcService())
++	if pt.published {
++		fmt.Fprintln(&b, "\n// serviceName is the contract's fully-qualified gRPC service name.")
++	} else {
++		fmt.Fprintln(&b, "\n// serviceName is the point's fully-qualified gRPC service name.")
++	}
++	fmt.Fprintf(&b, "const serviceName = %q\n", pt.grpcService())
+ 
+ 	fmt.Fprintln(&b, "\nconst (")
+ 	for _, m := range pt.methods {
+@@ -711,20 +728,32 @@ func emitWire(pt point) ([]byte, error) {
+ 	}
+ 	fmt.Fprintln(&b, ")")
+ 
+-	fmt.Fprintf(&b, `
++	if pt.published {
++		fmt.Fprintf(&b, `
++// %[1]sServer is the server side of the contract's gRPC service. It is the
++// proto-level shape of the service, not the handwritten Go interface: a contract
++// method returning a bare error returns an empty response message here.
++type %[1]sServer interface {
++`, svc)
++	} else {
++		fmt.Fprintf(&b, `
+ // %[1]sServer is the server side of the point's gRPC service. It is the
+ // proto-level shape of the point, not the point's Go interface: a contract
+ // method returning a bare error returns an empty response message here.
+ type %[1]sServer interface {
+ `, svc)
++	}
+ 	for _, m := range pt.methods {
+ 		fmt.Fprintf(&b, "\t%s(context.Context, *%s) (*%s, error)\n", m.name, m.request, m.response)
+ 	}
+ 	fmt.Fprintln(&b, "}")
+ 
+-	fmt.Fprintf(&b, `
+-// serviceDesc describes the point's gRPC service to a server. HandlerType is
+-// what a registrar type-checks an implementation against, so registering the
++	if pt.published {
++		fmt.Fprintln(&b, "\n// serviceDesc describes the contract's gRPC service to a server. HandlerType is")
++	} else {
++		fmt.Fprintln(&b, "\n// serviceDesc describes the point's gRPC service to a server. HandlerType is")
++	}
++	fmt.Fprintf(&b, `// what a registrar type-checks an implementation against, so registering the
+ // wrong provider for this point is caught at registration.
+ var serviceDesc = grpc.ServiceDesc{
+ 	ServiceName: serviceName,
+@@ -755,20 +784,32 @@ func %[1]s(srv any, ctx context.Context, dec func(any) error, interceptor grpc.U
+ `, handlerName(m), m.request, svc, m.name, methodConst(m))
+ 	}
+ 
+-	fmt.Fprintf(&b, `
++	if pt.published {
++		fmt.Fprintf(&b, `
++// %[1]sClient calls the contract's raw gRPC service. It is exported so a client
++// outside the framework - one calling a service an extension publishes on the
++// API socket - can reach it with a plain gRPC client.
++type %[1]sClient interface {
++`, svc)
++	} else {
++		fmt.Fprintf(&b, `
+ // %[1]sClient calls the point's gRPC service. It is exported so a client
+ // outside the framework - one calling a service an extension publishes on the
+ // API socket - can reach it with a plain gRPC client.
+ type %[1]sClient interface {
+ `, svc)
++	}
+ 	for _, m := range pt.methods {
+ 		fmt.Fprintf(&b, "\t%s(ctx context.Context, in *%s, opts ...grpc.CallOption) (*%s, error)\n", m.name, m.request, m.response)
+ 	}
+ 	fmt.Fprintln(&b, "}")
+ 
+-	fmt.Fprintf(&b, `
+-// New%[1]sClient returns a client for the point's gRPC service on cc.
+-func New%[1]sClient(cc grpc.ClientConnInterface) %[1]sClient { return &serviceClient{cc: cc} }
++	if pt.published {
++		fmt.Fprintf(&b, "\n// New%[1]sClient returns a client for the contract's raw gRPC service on cc.\n", svc)
++	} else {
++		fmt.Fprintf(&b, "\n// New%[1]sClient returns a client for the point's gRPC service on cc.\n", svc)
++	}
++	fmt.Fprintf(&b, `func New%[1]sClient(cc grpc.ClientConnInterface) %[1]sClient { return &serviceClient{cc: cc} }
+ 
+ type serviceClient struct{ cc grpc.ClientConnInterface }
+ `, svc)
+@@ -817,6 +858,28 @@ func NewClient(conn grpc.ClientConnInterface) %[2]s.%[3]s {
+ 	return &grpcClient{client: New%[1]sClient(conn)}
+ }
+ `, svc, cpkg, iface)
++		if pt.published {
++			fmt.Fprintf(&b, `
++
++// Service is the transport-neutral typed definition of the published %[1]s service.
++var Service = servicev0.Define(serviceName, func(r servicev0.Registrar, impl %[2]s.%[3]s) {
++		r.RegisterService(servicev0.Registration{
++			Service: serviceName,
++			Methods: []servicev0.Method{
++`, svc, cpkg, iface)
++			for _, m := range pt.methods {
++				fmt.Fprintf(&b, `					{Name: %q, NewRequest: func() any { return new(%s) }, Handler: func(ctx context.Context, request any) (any, error) {
++					return (&grpcServer{impl: impl}).%s(ctx, request.(*%s))
++				}},
++`, m.name, m.request, m.name, m.request)
++			}
++			fmt.Fprintf(&b, `				},
++		})
++	}, func(invoker servicev0.Invoker) %[1]s.%[2]s {
++		return &typedClient{invoker: invoker}
++	})
++`, cpkg, iface)
++		}
+ 	}
+ 
+ 	fmt.Fprintf(&b, `
+@@ -854,6 +917,13 @@ type grpcClient struct {
+ 	client %sClient
+ }
+ `, svc)
++	if pt.published {
++		fmt.Fprint(&b, `
++type typedClient struct {
++	invoker servicev0.Invoker
++}
++`)
++	}
+ 
+ 	for _, m := range pt.methods {
+ 		if m.bareError {
+@@ -874,6 +944,25 @@ func (c *grpcClient) %[1]s(ctx context.Context, req *%[2]s.%[3]s) (*%[2]s.%[5]s,
+ }
+ `, m.name, cpkg, m.request, lowerFirst(m.request), m.response, lowerFirst(m.response))
+ 		}
++		if pt.published {
++			if m.bareError {
++				fmt.Fprintf(&b, `
++func (c *typedClient) %[1]s(ctx context.Context, req *%[2]s.%[3]s) error {
++	return c.invoker.Invoke(ctx, serviceName, %[4]q, %[5]sToProto(req), new(%[6]s))
++}
++`, m.name, cpkg, m.request, m.name, lowerFirst(m.request), m.response)
++			} else {
++				fmt.Fprintf(&b, `
++func (c *typedClient) %[1]s(ctx context.Context, req *%[2]s.%[3]s) (*%[2]s.%[4]s, error) {
++	out := new(%[4]s)
++	if err := c.invoker.Invoke(ctx, serviceName, %[5]q, %[6]sToProto(req), out); err != nil {
++		return nil, err
++	}
++	return %[7]sFromProto(out), nil
++}
++`, m.name, cpkg, m.request, m.response, m.name, lowerFirst(m.request), lowerFirst(m.response))
++			}
++		}
+ 	}
+ 
+ 	for _, msg := range pt.messages {
+diff --git internal/extensions/cmd/mobyextgen/main_test.go internal/extensions/cmd/mobyextgen/main_test.go
+index ead639c8d1..374936a9d4 100644
+--- internal/extensions/cmd/mobyextgen/main_test.go
++++ internal/extensions/cmd/mobyextgen/main_test.go
+@@ -259,6 +259,48 @@ type Runtime interface{ Do(ctx interface{
+ 	assert.Check(t, !strings.Contains(src, "clientpoint"), "a non-point contract must not import the point packages:\n%s", src)
+ }
+ 
++func TestPublishedServiceContract(t *testing.T) {
++	const contract = `package p
++type Req struct{ Name string ` + "`pb:\"1\"`" + ` }
++type Resp struct{ Ok bool ` + "`pb:\"1\"`" + ` }
++
++//mobyextgen:publish
++//mobyextgen:service=my.proto.pkg.v1.Runtime
++type Runtime interface{ Do(ctx interface{}, req *Req) (*Resp, error) }
++`
++	pt, err := parseSource(t, contract)
++	assert.NilError(t, err)
++	assert.Check(t, pt.published)
++	pt.importPath = "example.com/p"
++	wire, err := emitWire(pt)
++	assert.NilError(t, err)
++	src := string(wire)
++	assert.Check(t, strings.Contains(src, "var Service = servicev0.Define(serviceName"), src)
++	assert.Check(t, strings.Contains(src, `Invoke(ctx, serviceName, "Do"`), src)
++}
++
++func TestPublishRejectedOnPoint(t *testing.T) {
++	_, err := parseSource(t, `package p
++import "github.com/moby/moby/v2/internal/extensions"
++type Req struct{}
++type Resp struct{}
++type Runtime interface{ Do(ctx interface{}, req *Req) (*Resp, error) }
++//mobyextgen:publish
++//mobyextgen:service=Runtime
++var Point = extensions.DefinePoint[Runtime]("example.point.v1")
++`)
++	assert.ErrorContains(t, err, "publish is only valid on a non-point service interface")
++}
++
++func TestPublishRequiresServicePragma(t *testing.T) {
++	_, err := parseSource(t, `package p
++//mobyextgen:publish
++type Runtime interface{
++}
++`)
++	assert.ErrorContains(t, err, "publish requires a mobyextgen:service pragma")
++}
++
+ func TestServicePragmaOnANonInterface(t *testing.T) {
+ 	_, err := parseSource(t, `package p
+ type Req struct{ Name string `+"`pb:\"1\"`"+` }
+diff --git internal/extensions/docs/AUTHORING.md internal/extensions/docs/AUTHORING.md
+index 8f889522e2..58e1a20d2c 100644
+--- internal/extensions/docs/AUTHORING.md
++++ internal/extensions/docs/AUTHORING.md
+@@ -189,43 +189,59 @@ ### 5. Support separate-binary providers
+ This list is the boundary for launched providers: an unlisted declared point is rejected, while any installed extension may provide a listed point.
+ See [DESIGN.md#discovery-security](./DESIGN.md#discovery-security).
+ 
+-An externally published gRPC service is not added to this list.
++An externally published service is not added to this list.
+ It uses socket exposure instead.
+ 
+ ### Socket-exposed services
+ 
+-Socket exposure is an extension's own gRPC API, not a daemon-called point.
+-The daemon forwards raw calls by service name without importing the proto.
+-Opt in with `service.grpc` and register through the supplied registrar:
++Socket exposure publishes an extension's own typed API, not a daemon-called
++point.
++Write the same handwritten interface and messages as for a point, but put the
++service pragma and the explicit publication marker on the interface:
+ 
+ ```go
+-type expose struct{}
+-
+-func (expose) RegisterServices(r grpc.ServiceRegistrar) {
+-	mypb.RegisterMyServiceServer(r, impl) // or mypb.ServerPoint.Register(r, impl)
++//mobyextgen:publish
++//mobyextgen:service=com.example.myext.v1.Greeter
++type Greeter interface {
++	Greet(context.Context, *HelloRequest) (*HelloReply, error)
+ }
++```
++
++Generation emits `mypb.Service`, a transport-neutral
++`servicev0.Definition[Greeter]`.
++Publish an ordinary Go implementation without importing gRPC or protobuf types:
+ 
++```go
+ var Extension = extensions.New(extensions.Declaration{
+ 	ID:        "com.example.myext.v1",
+-	Providers: []extensions.Provider{servicegrpcv0.Point.Provide(expose{})},
++	Providers: []extensions.Provider{mypb.Service.Expose(greeter{})},
+ })
+ ```
+ 
+-The same implementation works in both modes: in-process, the daemon supplies its gRPC server; out-of-process, the SDK supplies the extension server, records names, and the daemon proxies matching calls.
++The SDK knows the typed-service infrastructure registration, so a binary that
++only publishes typed services uses `sdk.Main(Extension)`.
++Continue to pass generated `ServerPoint` values explicitly for ordinary points.
+ 
+-An out-of-process binary registers `ServerPoint` for every point it provides:
++Clients derive one reusable extension RPC connection from an existing Engine
++client and resolve the same handwritten interface:
+ 
+ ```go
+-srv := sdk.NewServer()
+-srv.Register(ext,
+-	servicegrpcv0.ServerPoint,
+-	mypointpb.ServerPoint, // include every other point this extension provides
+-)
+-srv.Listen(ctx)
++rpc, err := extensionclient.New(engine)
++if err != nil { /* handle */ }
++defer rpc.Close()
++greeter := extensionclient.Resolve(rpc, mypb.Service)
++reply, err := greeter.Greet(ctx, &myv1.HelloRequest{Name: "world"})
+ ```
+ 
++The public author and client APIs are transport-neutral; the current backend is
++gRPC and the daemon proxies out-of-process services by their stable service
++identity.
++The client currently supports local `unix` and `npipe` Engine hosts only;
++TCP hosts cannot safely recover the Engine connection's TLS and ALPN settings.
++For an existing or otherwise custom raw gRPC API, `servicegrpcv0` remains an
++escape hatch: implement `RegisterServices(grpc.ServiceRegistrar)`, provide
++`servicegrpcv0.Point`, and pass `servicegrpcv0.ServerPoint` to the SDK explicitly.
+ Service names are captured from registration, so do not list them manually.
+-Point id, proto package, gRPC service name, and CLI route remain different identifiers; see [DESIGN.md#identifiers](./DESIGN.md#identifiers).
+ 
+ ## Writing an extension
+ 
+diff --git internal/extensions/docs/DESIGN.md internal/extensions/docs/DESIGN.md
+index 70f371deb0..b86e2146ed 100644
+--- internal/extensions/docs/DESIGN.md
++++ internal/extensions/docs/DESIGN.md
+@@ -87,16 +87,30 @@ ## Resolution, ordering, and lifecycle
+ 
+ ## Socket exposure
+ 
+-An extension is reachable only through daemon-internal calls unless it provides `org.mobyproject.extension.service.grpc.v0`.
+-This point takes a `grpc.ServiceRegistrar`, so it is resolved locally rather than sent over the wire.
+-It publishes an extension's own gRPC services on `docker.sock` without requiring the daemon to import that extension's proto.
+-
+-- In-process, the daemon registers the services on its gRPC server beside built-ins such as BuildKit.
+-- Out-of-process, the SDK registers them on the extension server and reports their fully qualified names.
+-  The daemon proxies matching calls by name and forwards the raw gRPC stream, including metadata and status.
++An extension is reachable only through daemon-internal calls unless it provides
++the typed `org.mobyproject.extension.service.v0` infrastructure point or the raw
++`org.mobyproject.extension.service.grpc.v0` escape hatch.
++Published typed contracts opt in with `mobyextgen:publish`; generation emits a
++transport-neutral `servicev0.Definition[T]` which exposes a handwritten Go
++implementation and constructs the same handwritten interface for clients.
++The public author and client APIs do not expose gRPC types.
++
++The current backend is gRPC; transport replacement is not implemented.
++The public extension client is currently limited to local `unix` and `npipe`
++Engine hosts. TCP hosts are rejected because the Engine client's TLS and ALPN
++details cannot safely be recovered for the extension connection.
++
++- In-process, an internal adapter converts typed unary method registrations to
++  `grpc.ServiceDesc` and registers them beside built-ins such as BuildKit.
++- Out-of-process, the SDK automatically installs that adapter, records stable
++  service identities, and the daemon proxies matching calls by identity,
++  including metadata and status.
++- Raw `servicegrpcv0` providers continue to take a `grpc.ServiceRegistrar` and
++  require explicit SDK registration.
+ 
+ Service names are captured from registration, not listed manually.
+-The extension must declare the service-exposure point as a provider before publishing its service inventory.
++The extension declares the typed or raw service-exposure infrastructure point
++through its provider declaration before publishing its service inventory.
+ A name cannot collide with another extension or a service already served by the daemon; collision fails startup rather than shadowing the existing service.
+ 
+ These services use the raw gRPC endpoint beside the daemon's own gRPC services.
+diff --git internal/extensions/docs/README.md internal/extensions/docs/README.md
+index b36e0ee071..3a46e565ec 100644
+--- internal/extensions/docs/README.md
++++ internal/extensions/docs/README.md
+@@ -11,7 +11,9 @@ ## Mental model
+ - The host registers extensions, resolves typed dependencies, initializes them in dependency order, and routes calls through points.
+ - Wire code is generated from the Go contract.
+   The generated proto and adapters let a separate-binary provider be written in another language.
+-- Socket exposure is an explicit point: an extension may add its own gRPC services to `docker.sock` without adding a built-in REST API.
++- Socket exposure is explicit: an extension may publish a typed service on
++  `docker.sock` without adding a built-in REST API.
++  Its public Go API is transport-neutral; the current backend is gRPC.
+ 
+ ## Principles
+ 
+diff --git internal/extensions/example/greeter/v0/greeter.go internal/extensions/example/greeter/v0/greeter.go
+index a8cbe195ca..7c30cfe3b1 100644
+--- internal/extensions/example/greeter/v0/greeter.go
++++ internal/extensions/example/greeter/v0/greeter.go
+@@ -1,16 +1,15 @@
+ //go:generate go run github.com/moby/moby/v2/internal/extensions/cmd/mobyextgen
+ 
+-// Package greeterv0 is an example service point used to exercise socket
+-// exposure.
++// Package greeterv0 is an example published service contract used to exercise
++// socket exposure.
+ package greeterv0
+ 
+-import (
+-	"context"
+-
+-	"github.com/moby/moby/v2/internal/extensions"
+-)
++import "context"
+ 
+ // Greeter is the example service.
++//
++//mobyextgen:publish
++//mobyextgen:service=org.mobyproject.extension.example.greeter.v0.Greeter
+ type Greeter interface {
+ 	Greet(ctx context.Context, req *HelloRequest) (*HelloReply, error)
+ }
+@@ -24,15 +23,3 @@ type HelloRequest struct {
+ type HelloReply struct {
+ 	Message string `pb:"1"`
+ }
+-
+-//mobyextgen:service=Greeter
+-var Point = extensions.DefinePoint[Greeter]("org.mobyproject.extension.example.greeter.v0")
+-
+-// Greet calls the greeter provider.
+-func Greet(ctx context.Context, resolver extensions.Resolver, req *HelloRequest) (*HelloReply, error) {
+-	g, err := Point.Single(resolver)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return g.Greet(ctx, req)
+-}
+diff --git internal/extensions/example/greeter/v0/protogen/wire.gen.go internal/extensions/example/greeter/v0/protogen/wire.gen.go
+index 1635c95516..4b5a228f91 100644
+--- internal/extensions/example/greeter/v0/protogen/wire.gen.go
++++ internal/extensions/example/greeter/v0/protogen/wire.gen.go
+@@ -3,28 +3,26 @@
+ 
+ import (
+ 	context "context"
+-	extensions "github.com/moby/moby/v2/internal/extensions"
+-	clientpoint "github.com/moby/moby/v2/internal/extensions/clientpoint"
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
+ 	greeterv0 "github.com/moby/moby/v2/internal/extensions/example/greeter/v0"
+-	serverpoint "github.com/moby/moby/v2/internal/extensions/serverpoint"
+ 	grpc "google.golang.org/grpc"
+ )
+ 
+-// serviceName is the point's fully-qualified gRPC service name.
++// serviceName is the contract's fully-qualified gRPC service name.
+ const serviceName = "org.mobyproject.extension.example.greeter.v0.Greeter"
+ 
+ const (
+ 	methodGreet = "/" + serviceName + "/Greet"
+ )
+ 
+-// GreeterServer is the server side of the point's gRPC service. It is the
+-// proto-level shape of the point, not the point's Go interface: a contract
++// GreeterServer is the server side of the contract's gRPC service. It is the
++// proto-level shape of the service, not the handwritten Go interface: a contract
+ // method returning a bare error returns an empty response message here.
+ type GreeterServer interface {
+ 	Greet(context.Context, *HelloRequest) (*HelloReply, error)
+ }
+ 
+-// serviceDesc describes the point's gRPC service to a server. HandlerType is
++// serviceDesc describes the contract's gRPC service to a server. HandlerType is
+ // what a registrar type-checks an implementation against, so registering the
+ // wrong provider for this point is caught at registration.
+ var serviceDesc = grpc.ServiceDesc{
+@@ -50,14 +48,14 @@ func handleGreet(srv any, ctx context.Context, dec func(any) error, interceptor
+ 	})
+ }
+ 
+-// GreeterClient calls the point's gRPC service. It is exported so a client
++// GreeterClient calls the contract's raw gRPC service. It is exported so a client
+ // outside the framework - one calling a service an extension publishes on the
+ // API socket - can reach it with a plain gRPC client.
+ type GreeterClient interface {
+ 	Greet(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloReply, error)
+ }
+ 
+-// NewGreeterClient returns a client for the point's gRPC service on cc.
++// NewGreeterClient returns a client for the contract's raw gRPC service on cc.
+ func NewGreeterClient(cc grpc.ClientConnInterface) GreeterClient { return &serviceClient{cc: cc} }
+ 
+ type serviceClient struct{ cc grpc.ClientConnInterface }
+@@ -70,23 +68,29 @@ func (c *serviceClient) Greet(ctx context.Context, in *HelloRequest, opts ...grp
+ 	return out, nil
+ }
+ 
+-// ServerPoint serves the Greeter point: it registers the point's gRPC service for
+-// a provider with an SDK server. A binary passes it to (*sdk.Server).Register.
+-var ServerPoint = serverpoint.Registration{
+-	Point: greeterv0.Point.ID(),
+-	Register: func(r grpc.ServiceRegistrar, impl any) {
+-		r.RegisterService(&serviceDesc, &grpcServer{impl: impl.(greeterv0.Greeter)})
+-	},
++// RegisterServer serves impl as the Greeter service on r.
++func RegisterServer(r grpc.ServiceRegistrar, impl greeterv0.Greeter) {
++	r.RegisterService(&serviceDesc, &grpcServer{impl: impl})
+ }
+ 
+-// ClientProvider builds a broker provider for the Greeter point from an
+-// out-of-process gRPC connection.
+-func ClientProvider(conn grpc.ClientConnInterface) extensions.Provider {
+-	return greeterv0.Point.Provide(&grpcClient{client: NewGreeterClient(conn)})
++// NewClient returns a greeterv0.Greeter that calls the Greeter service over conn.
++func NewClient(conn grpc.ClientConnInterface) greeterv0.Greeter {
++	return &grpcClient{client: NewGreeterClient(conn)}
+ }
+ 
+-// ClientPoint registers ClientProvider for the Greeter point with a host.
+-var ClientPoint = clientpoint.Registration{Point: greeterv0.Point.ID(), Provider: ClientProvider}
++// Service is the transport-neutral typed definition of the published Greeter service.
++var Service = servicev0.Define(serviceName, func(r servicev0.Registrar, impl greeterv0.Greeter) {
++	r.RegisterService(servicev0.Registration{
++		Service: serviceName,
++		Methods: []servicev0.Method{
++			{Name: "Greet", NewRequest: func() any { return new(HelloRequest) }, Handler: func(ctx context.Context, request any) (any, error) {
++				return (&grpcServer{impl: impl}).Greet(ctx, request.(*HelloRequest))
++			}},
++		},
++	})
++}, func(invoker servicev0.Invoker) greeterv0.Greeter {
++	return &typedClient{invoker: invoker}
++})
+ 
+ // grpcServer serves an implementation of the contract's Go interface.
+ type grpcServer struct {
+@@ -105,6 +109,10 @@ type grpcClient struct {
+ 	client GreeterClient
+ }
+ 
++type typedClient struct {
++	invoker servicev0.Invoker
++}
++
+ func (c *grpcClient) Greet(ctx context.Context, req *greeterv0.HelloRequest) (*greeterv0.HelloReply, error) {
+ 	resp, err := c.client.Greet(ctx, helloRequestToProto(req))
+ 	if err != nil {
+@@ -113,6 +121,14 @@ func (c *grpcClient) Greet(ctx context.Context, req *greeterv0.HelloRequest) (*g
+ 	return helloReplyFromProto(resp), nil
+ }
+ 
++func (c *typedClient) Greet(ctx context.Context, req *greeterv0.HelloRequest) (*greeterv0.HelloReply, error) {
++	out := new(HelloReply)
++	if err := c.invoker.Invoke(ctx, serviceName, "Greet", helloRequestToProto(req), out); err != nil {
++		return nil, err
++	}
++	return helloReplyFromProto(out), nil
++}
++
+ func helloReplyToProto(in *greeterv0.HelloReply) *HelloReply {
+ 	if in == nil {
+ 		return nil
+diff --git internal/extensions/example/greeterpoint/v0/greeter.go internal/extensions/example/greeterpoint/v0/greeter.go
+new file mode 100644
+index 0000000000..3b9bcbc431
+--- /dev/null
++++ internal/extensions/example/greeterpoint/v0/greeter.go
+@@ -0,0 +1,37 @@
++//go:generate go run github.com/moby/moby/v2/internal/extensions/cmd/mobyextgen
++
++// Package greeterpointv0 defines the private point used by dependency tests.
++package greeterpointv0
++
++import (
++	"context"
++
++	"github.com/moby/moby/v2/internal/extensions"
++)
++
++// Greeter is the dependency-test provider interface.
++type Greeter interface {
++	Greet(context.Context, *HelloRequest) (*HelloReply, error)
++}
++
++// HelloRequest is the greeting request.
++type HelloRequest struct {
++	Name string `pb:"1"`
++}
++
++// HelloReply is the greeting response.
++type HelloReply struct {
++	Message string `pb:"1"`
++}
++
++//mobyextgen:service=Greeter
++var Point = extensions.DefinePoint[Greeter]("org.mobyproject.extension.example.greeterpoint.v0")
++
++// Greet resolves and calls the greeter dependency.
++func Greet(ctx context.Context, resolver extensions.Resolver, req *HelloRequest) (*HelloReply, error) {
++	greeter, err := Point.Single(resolver)
++	if err != nil {
++		return nil, err
++	}
++	return greeter.Greet(ctx, req)
++}
+diff --git internal/extensions/example/greeterpoint/v0/greeter.proto internal/extensions/example/greeterpoint/v0/greeter.proto
+new file mode 100644
+index 0000000000..2628850dcb
+--- /dev/null
++++ internal/extensions/example/greeterpoint/v0/greeter.proto
+@@ -0,0 +1,19 @@
++// Code generated by mobyextgen. DO NOT EDIT.
++
++syntax = "proto3";
++
++package org.mobyproject.extension.example.greeterpoint.v0;
++
++option go_package = "github.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0/protogen";
++
++service Greeter {
++  rpc Greet(HelloRequest) returns (HelloReply);
++}
++
++message HelloReply {
++  string message = 1;
++}
++
++message HelloRequest {
++  string name = 1;
++}
+diff --git internal/extensions/example/greeterpoint/v0/protogen/greeter.pb.go internal/extensions/example/greeterpoint/v0/protogen/greeter.pb.go
+new file mode 100644
+index 0000000000..9d0a047522
+--- /dev/null
++++ internal/extensions/example/greeterpoint/v0/protogen/greeter.pb.go
+@@ -0,0 +1,174 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11-devel
++// 	protoc        (unknown)
++// source: internal/extensions/example/greeterpoint/v0/greeter.proto
++
++package protogen
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++type HelloReply struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *HelloReply) Reset() {
++	*x = HelloReply{}
++	mi := &file_internal_extensions_example_greeterpoint_v0_greeter_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *HelloReply) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*HelloReply) ProtoMessage() {}
++
++func (x *HelloReply) ProtoReflect() protoreflect.Message {
++	mi := &file_internal_extensions_example_greeterpoint_v0_greeter_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use HelloReply.ProtoReflect.Descriptor instead.
++func (*HelloReply) Descriptor() ([]byte, []int) {
++	return file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *HelloReply) GetMessage() string {
++	if x != nil {
++		return x.Message
++	}
++	return ""
++}
++
++type HelloRequest struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *HelloRequest) Reset() {
++	*x = HelloRequest{}
++	mi := &file_internal_extensions_example_greeterpoint_v0_greeter_proto_msgTypes[1]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *HelloRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*HelloRequest) ProtoMessage() {}
++
++func (x *HelloRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_internal_extensions_example_greeterpoint_v0_greeter_proto_msgTypes[1]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use HelloRequest.ProtoReflect.Descriptor instead.
++func (*HelloRequest) Descriptor() ([]byte, []int) {
++	return file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *HelloRequest) GetName() string {
++	if x != nil {
++		return x.Name
++	}
++	return ""
++}
++
++var File_internal_extensions_example_greeterpoint_v0_greeter_proto protoreflect.FileDescriptor
++
++const file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDesc = "" +
++	"\n" +
++	"9internal/extensions/example/greeterpoint/v0/greeter.proto\x121org.mobyproject.extension.example.greeterpoint.v0\"&\n" +
++	"\n" +
++	"HelloReply\x12\x18\n" +
++	"\amessage\x18\x01 \x01(\tR\amessage\"\"\n" +
++	"\fHelloRequest\x12\x12\n" +
++	"\x04name\x18\x01 \x01(\tR\x04name2\x93\x01\n" +
++	"\aGreeter\x12\x87\x01\n" +
++	"\x05Greet\x12?.org.mobyproject.extension.example.greeterpoint.v0.HelloRequest\x1a=.org.mobyproject.extension.example.greeterpoint.v0.HelloReplyBNZLgithub.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0/protogenb\x06proto3"
++
++var (
++	file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescOnce sync.Once
++	file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescData []byte
++)
++
++func file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescGZIP() []byte {
++	file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescOnce.Do(func() {
++		file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDesc), len(file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDesc)))
++	})
++	return file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDescData
++}
++
++var file_internal_extensions_example_greeterpoint_v0_greeter_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
++var file_internal_extensions_example_greeterpoint_v0_greeter_proto_goTypes = []any{
++	(*HelloReply)(nil),   // 0: org.mobyproject.extension.example.greeterpoint.v0.HelloReply
++	(*HelloRequest)(nil), // 1: org.mobyproject.extension.example.greeterpoint.v0.HelloRequest
++}
++var file_internal_extensions_example_greeterpoint_v0_greeter_proto_depIdxs = []int32{
++	1, // 0: org.mobyproject.extension.example.greeterpoint.v0.Greeter.Greet:input_type -> org.mobyproject.extension.example.greeterpoint.v0.HelloRequest
++	0, // 1: org.mobyproject.extension.example.greeterpoint.v0.Greeter.Greet:output_type -> org.mobyproject.extension.example.greeterpoint.v0.HelloReply
++	1, // [1:2] is the sub-list for method output_type
++	0, // [0:1] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++func init() { file_internal_extensions_example_greeterpoint_v0_greeter_proto_init() }
++func file_internal_extensions_example_greeterpoint_v0_greeter_proto_init() {
++	if File_internal_extensions_example_greeterpoint_v0_greeter_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDesc), len(file_internal_extensions_example_greeterpoint_v0_greeter_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   2,
++			NumExtensions: 0,
++			NumServices:   1,
++		},
++		GoTypes:           file_internal_extensions_example_greeterpoint_v0_greeter_proto_goTypes,
++		DependencyIndexes: file_internal_extensions_example_greeterpoint_v0_greeter_proto_depIdxs,
++		MessageInfos:      file_internal_extensions_example_greeterpoint_v0_greeter_proto_msgTypes,
++	}.Build()
++	File_internal_extensions_example_greeterpoint_v0_greeter_proto = out.File
++	file_internal_extensions_example_greeterpoint_v0_greeter_proto_goTypes = nil
++	file_internal_extensions_example_greeterpoint_v0_greeter_proto_depIdxs = nil
++}
+diff --git internal/extensions/example/greeterpoint/v0/protogen/wire.gen.go internal/extensions/example/greeterpoint/v0/protogen/wire.gen.go
+new file mode 100644
+index 0000000000..3a4ed8ced5
+--- /dev/null
++++ internal/extensions/example/greeterpoint/v0/protogen/wire.gen.go
+@@ -0,0 +1,150 @@
++// Code generated by mobyextgen. DO NOT EDIT.
++package protogen
++
++import (
++	context "context"
++	extensions "github.com/moby/moby/v2/internal/extensions"
++	clientpoint "github.com/moby/moby/v2/internal/extensions/clientpoint"
++	greeterpointv0 "github.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0"
++	serverpoint "github.com/moby/moby/v2/internal/extensions/serverpoint"
++	grpc "google.golang.org/grpc"
++)
++
++// serviceName is the point's fully-qualified gRPC service name.
++const serviceName = "org.mobyproject.extension.example.greeterpoint.v0.Greeter"
++
++const (
++	methodGreet = "/" + serviceName + "/Greet"
++)
++
++// GreeterServer is the server side of the point's gRPC service. It is the
++// proto-level shape of the point, not the point's Go interface: a contract
++// method returning a bare error returns an empty response message here.
++type GreeterServer interface {
++	Greet(context.Context, *HelloRequest) (*HelloReply, error)
++}
++
++// serviceDesc describes the point's gRPC service to a server. HandlerType is
++// what a registrar type-checks an implementation against, so registering the
++// wrong provider for this point is caught at registration.
++var serviceDesc = grpc.ServiceDesc{
++	ServiceName: serviceName,
++	HandlerType: (*GreeterServer)(nil),
++	Metadata:    "internal/extensions/example/greeterpoint/v0/greeter.proto",
++	Methods: []grpc.MethodDesc{
++		{MethodName: "Greet", Handler: handleGreet},
++	},
++}
++
++func handleGreet(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
++	in := new(HelloRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GreeterServer).Greet(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodGreet}
++	return interceptor(ctx, in, info, func(ctx context.Context, req any) (any, error) {
++		return srv.(GreeterServer).Greet(ctx, req.(*HelloRequest))
++	})
++}
++
++// GreeterClient calls the point's gRPC service. It is exported so a client
++// outside the framework - one calling a service an extension publishes on the
++// API socket - can reach it with a plain gRPC client.
++type GreeterClient interface {
++	Greet(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloReply, error)
++}
++
++// NewGreeterClient returns a client for the point's gRPC service on cc.
++func NewGreeterClient(cc grpc.ClientConnInterface) GreeterClient { return &serviceClient{cc: cc} }
++
++type serviceClient struct{ cc grpc.ClientConnInterface }
++
++func (c *serviceClient) Greet(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloReply, error) {
++	out := new(HelloReply)
++	if err := c.cc.Invoke(ctx, methodGreet, in, out, append([]grpc.CallOption{grpc.StaticMethod()}, opts...)...); err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// ServerPoint serves the Greeter point: it registers the point's gRPC service for
++// a provider with an SDK server. A binary passes it to (*sdk.Server).Register.
++var ServerPoint = serverpoint.Registration{
++	Point: greeterpointv0.Point.ID(),
++	Register: func(r grpc.ServiceRegistrar, impl any) {
++		r.RegisterService(&serviceDesc, &grpcServer{impl: impl.(greeterpointv0.Greeter)})
++	},
++}
++
++// ClientProvider builds a broker provider for the Greeter point from an
++// out-of-process gRPC connection.
++func ClientProvider(conn grpc.ClientConnInterface) extensions.Provider {
++	return greeterpointv0.Point.Provide(&grpcClient{client: NewGreeterClient(conn)})
++}
++
++// ClientPoint registers ClientProvider for the Greeter point with a host.
++var ClientPoint = clientpoint.Registration{Point: greeterpointv0.Point.ID(), Provider: ClientProvider}
++
++// grpcServer serves an implementation of the contract's Go interface.
++type grpcServer struct {
++	impl greeterpointv0.Greeter
++}
++
++func (s *grpcServer) Greet(ctx context.Context, req *HelloRequest) (*HelloReply, error) {
++	resp, err := s.impl.Greet(ctx, helloRequestFromProto(req))
++	if err != nil {
++		return nil, err
++	}
++	return helloReplyToProto(resp), nil
++}
++
++type grpcClient struct {
++	client GreeterClient
++}
++
++func (c *grpcClient) Greet(ctx context.Context, req *greeterpointv0.HelloRequest) (*greeterpointv0.HelloReply, error) {
++	resp, err := c.client.Greet(ctx, helloRequestToProto(req))
++	if err != nil {
++		return nil, err
++	}
++	return helloReplyFromProto(resp), nil
++}
++
++func helloReplyToProto(in *greeterpointv0.HelloReply) *HelloReply {
++	if in == nil {
++		return nil
++	}
++	out := &HelloReply{}
++	out.Message = in.Message
++	return out
++}
++
++func helloReplyFromProto(in *HelloReply) *greeterpointv0.HelloReply {
++	if in == nil {
++		return nil
++	}
++	out := &greeterpointv0.HelloReply{}
++	out.Message = in.GetMessage()
++	return out
++}
++
++func helloRequestToProto(in *greeterpointv0.HelloRequest) *HelloRequest {
++	if in == nil {
++		return nil
++	}
++	out := &HelloRequest{}
++	out.Name = in.Name
++	return out
++}
++
++func helloRequestFromProto(in *HelloRequest) *greeterpointv0.HelloRequest {
++	if in == nil {
++		return nil
++	}
++	out := &greeterpointv0.HelloRequest{}
++	out.Name = in.GetName()
++	return out
++}
+diff --git internal/extensions/host/dependency_test.go internal/extensions/host/dependency_test.go
+index 31fe2b60ec..73b36af546 100644
+--- internal/extensions/host/dependency_test.go
++++ internal/extensions/host/dependency_test.go
+@@ -12,8 +12,8 @@
+ 
+ 	"github.com/moby/moby/v2/integration/extension/testdata/greeterdep"
+ 	"github.com/moby/moby/v2/internal/extensions"
+-	greeterv0 "github.com/moby/moby/v2/internal/extensions/example/greeter/v0"
+-	greeterpb "github.com/moby/moby/v2/internal/extensions/example/greeter/v0/protogen"
++	greeterpointv0 "github.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0"
++	greeterpointpb "github.com/moby/moby/v2/internal/extensions/example/greeterpoint/v0/protogen"
+ 	"github.com/moby/moby/v2/internal/extensions/host"
+ 	"github.com/moby/moby/v2/internal/extensions/serverpoint"
+ 	"gotest.tools/v3/assert"
+@@ -37,9 +37,9 @@ func shortTempDir(t *testing.T) string {
+ 	return dir
+ }
+ 
+-func (g recordingGreeter) Greet(_ context.Context, req *greeterv0.HelloRequest) (*greeterv0.HelloReply, error) {
++func (g recordingGreeter) Greet(_ context.Context, req *greeterpointv0.HelloRequest) (*greeterpointv0.HelloReply, error) {
+ 	g.calls.Add(1)
+-	return &greeterv0.HelloReply{Message: "hello " + req.Name}, nil
++	return &greeterpointv0.HelloReply{Message: "hello " + req.Name}, nil
+ }
+ 
+ func TestOutOfProcessDependency(t *testing.T) {
+@@ -60,14 +60,14 @@ func TestOutOfProcessDependency(t *testing.T) {
+ 	var calls atomic.Int32
+ 	greeter := extensions.New(extensions.Declaration{
+ 		ID:        "org.mobyproject.example.greeter-provider.v1",
+-		Providers: []extensions.Provider{greeterv0.Point.Provide(recordingGreeter{calls: &calls})},
++		Providers: []extensions.Provider{greeterpointv0.Point.Provide(recordingGreeter{calls: &calls})},
+ 	})
+ 
+ 	h, err := host.New(ctx, host.Options{
+ 		RuntimeDir:          shortTempDir(t),
+ 		Extensions:          []extensions.Extension{greeter},
+ 		Dirs:                []string{dir},
+-		DependencyProviders: []serverpoint.Registration{greeterpb.ServerPoint},
++		DependencyProviders: []serverpoint.Registration{greeterpointpb.ServerPoint},
+ 	})
+ 	assert.NilError(t, err)
+ 	defer func() { assert.NilError(t, h.Shutdown(context.Background())) }()
+diff --git internal/extensions/host/socket_test.go internal/extensions/host/socket_test.go
+index b8d346994b..9831886932 100644
+--- internal/extensions/host/socket_test.go
++++ internal/extensions/host/socket_test.go
+@@ -8,7 +8,7 @@
+ 	"testing"
+ 	"time"
+ 
+-	servicegrpcv0 "github.com/moby/moby/v2/extpoints/servicegrpc/v0"
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
+ 	"github.com/moby/moby/v2/integration/extension/testdata/greeter"
+ 	"github.com/moby/moby/v2/internal/extensions"
+ 	"github.com/moby/moby/v2/internal/extensions/clientpoint"
+@@ -17,6 +17,7 @@
+ 	"github.com/moby/moby/v2/internal/extensions/host"
+ 	echov1 "github.com/moby/moby/v2/internal/extensions/internal/launcher/echo/v1"
+ 	echopb "github.com/moby/moby/v2/internal/extensions/internal/launcher/echo/v1/protogen"
++	"github.com/moby/moby/v2/internal/extensions/servicegrpc"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"gotest.tools/v3/assert"
+@@ -42,13 +43,13 @@ func TestSocketExposure(t *testing.T) {
+ 	h, err := host.New(ctx, host.Options{
+ 		RuntimeDir:       shortTempDir(t),
+ 		Dirs:             []string{dir},
+-		ExposeOnlyPoints: []extensions.PointID{servicegrpcv0.Point.ID()},
++		ExposeOnlyPoints: []extensions.PointID{servicev0.Point.ID()},
+ 	})
+ 	assert.NilError(t, err)
+ 	defer func() { assert.NilError(t, h.Shutdown(context.Background())) }()
+ 
+ 	routes := map[string]grpc.ClientConnInterface{}
+-	for ext, names := range h.ServicesForPoint(servicegrpcv0.Point.ID()) {
++	for ext, names := range h.ServicesForPoint(servicev0.Point.ID()) {
+ 		conn, ok := h.Conn(ext)
+ 		assert.Check(t, ok, "no connection for extension %q", ext)
+ 		for _, name := range names {
+@@ -99,7 +100,7 @@ func TestHookOnlyServicesAreNotSocketExposed(t *testing.T) {
+ 	assert.NilError(t, err)
+ 	defer func() { assert.NilError(t, h.Shutdown(context.Background())) }()
+ 
+-	assert.Check(t, h.ServicesForPoint(servicegrpcv0.Point.ID())[id] == nil)
++	assert.Check(t, h.ServicesForPoint(servicev0.Point.ID())[id] == nil)
+ 	assert.DeepEqual(t, h.ServicesForPoint(echov1.Point.ID())[id], []string{"moby.extensions.internal.launcher.echo.v1.Echo"})
+ 
+ 	conn, ok := h.Conn(id)
+@@ -121,11 +122,11 @@ func TestInProcessServiceExposure(t *testing.T) {
+ 	assert.NilError(t, err)
+ 	defer func() { assert.NilError(t, h.Shutdown(context.Background())) }()
+ 
+-	services, err := servicegrpcv0.Collect(h)
++	services, err := servicev0.Collect(h)
+ 	assert.NilError(t, err)
+ 	srv := grpc.NewServer()
+ 	for _, svc := range services {
+-		srv.RegisterService(svc.Desc, svc.Impl)
++		servicegrpc.Register(srv, svc)
+ 	}
+ 
+ 	sock := filepath.Join(shortTempDir(t), "api.sock")
+diff --git internal/extensions/sdk/main.go internal/extensions/sdk/main.go
+index 1534178383..8376a29e26 100644
+--- internal/extensions/sdk/main.go
++++ internal/extensions/sdk/main.go
+@@ -17,6 +17,9 @@
+ //		sdk.Main(myext.Extension, createspecpb.ServerPoint)
+ //	}
+ //
++// Typed published services are registered automatically. Ordinary extension
++// points and raw servicegrpcv0 providers still require explicit registrations.
++//
+ // A binary that needs [Server.Depends] or other server setup should build a
+ // [Server] directly.
+ func Main(ext extensions.Extension, points ...serverpoint.Registration) {
+diff --git internal/extensions/sdk/sdk.go internal/extensions/sdk/sdk.go
+index 473519dbbc..62ba781f55 100644
+--- internal/extensions/sdk/sdk.go
++++ internal/extensions/sdk/sdk.go
+@@ -15,6 +15,7 @@
+ 	"github.com/moby/moby/v2/internal/extensions/sdk/sdkapi"
+ 	sdkapipb "github.com/moby/moby/v2/internal/extensions/sdk/sdkapi/protogen"
+ 	"github.com/moby/moby/v2/internal/extensions/serverpoint"
++	"github.com/moby/moby/v2/internal/extensions/servicegrpc"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/credentials/insecure"
+ )
+@@ -61,6 +62,7 @@ func (s *Server) Register(ext extensions.Extension, points ...serverpoint.Regist
+ 		return errors.New("extension id is required")
+ 	}
+ 	byPoint := make(map[extensions.PointID]serverpoint.Register, len(points))
++	byPoint[servicegrpc.ServerPoint.Point] = servicegrpc.ServerPoint.Register
+ 	for _, p := range points {
+ 		byPoint[p.Point] = p.Register
+ 	}
+diff --git internal/extensions/sdk/sdk_test.go internal/extensions/sdk/sdk_test.go
+index 9570cec080..03ff61cf3f 100644
+--- internal/extensions/sdk/sdk_test.go
++++ internal/extensions/sdk/sdk_test.go
+@@ -11,6 +11,7 @@
+ 	"strings"
+ 	"testing"
+ 
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
+ 	"github.com/moby/moby/v2/internal/extensions"
+ 	"github.com/moby/moby/v2/internal/extensions/sdk/sdkapi"
+ 	sdkapipb "github.com/moby/moby/v2/internal/extensions/sdk/sdkapi/protogen"
+@@ -86,6 +87,19 @@ func TestRegisterRecordsServedServices(t *testing.T) {
+ 	assert.Check(t, is.Len(plainSrv.declaration.ProviderServices[0].Services, 0))
+ }
+ 
++func TestRegisterIncludesAutomaticTypedServicePoint(t *testing.T) {
++	registered := false
++	definition := servicev0.Define[any]("org.example.Service", func(servicev0.Registrar, any) {
++		registered = true
++	}, func(servicev0.Invoker) any { return nil })
++	srv := NewServer()
++	assert.NilError(t, srv.Register(extensions.New(extensions.Declaration{
++		ID:        "org.example.extension.v1",
++		Providers: []extensions.Provider{definition.Expose(struct{}{})},
++	})))
++	assert.Check(t, registered)
++}
++
+ func TestRegisterRejectsUnknownPoint(t *testing.T) {
+ 	srv := NewServer()
+ 	ext := extensions.New(extensions.Declaration{
+diff --git internal/extensions/servicegrpc/servicegrpc.go internal/extensions/servicegrpc/servicegrpc.go
+new file mode 100644
+index 0000000000..77b037e200
+--- /dev/null
++++ internal/extensions/servicegrpc/servicegrpc.go
+@@ -0,0 +1,92 @@
++// Package servicegrpc adapts transport-neutral published extension services to
++// the current gRPC backend.
++package servicegrpc
++
++import (
++	"context"
++
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
++	"github.com/moby/moby/v2/internal/extensions/serverpoint"
++	"google.golang.org/grpc"
++)
++
++// ServerPoint registers typed published services on an SDK gRPC server.
++var ServerPoint = serverpoint.Registration{
++	Point: servicev0.Point.ID(),
++	Register: func(r grpc.ServiceRegistrar, impl any) {
++		impl.(servicev0.Provider).RegisterServices(registrar{target: r})
++	},
++}
++
++// Service is a collected, not-yet-registered gRPC service.
++type Service struct {
++	Name string
++	Desc *grpc.ServiceDesc
++	Impl any
++}
++
++// Adapt converts a transport-neutral registration to a gRPC service.
++func Adapt(registration servicev0.Registration) Service {
++	impl := &server{}
++	desc := &grpc.ServiceDesc{
++		ServiceName: registration.Service,
++		HandlerType: (*serviceServer)(nil),
++		Methods:     make([]grpc.MethodDesc, 0, len(registration.Methods)),
++	}
++	for i := range registration.Methods {
++		method := &registration.Methods[i]
++		desc.Methods = append(desc.Methods, grpc.MethodDesc{
++			MethodName: method.Name,
++			Handler:    unaryHandler(registration.Service, method),
++		})
++	}
++	return Service{Name: registration.Service, Desc: desc, Impl: impl}
++}
++
++// Register adapts registration and registers it on r.
++func Register(r grpc.ServiceRegistrar, registration servicev0.Registration) {
++	service := Adapt(registration)
++	r.RegisterService(service.Desc, service.Impl)
++}
++
++type registrar struct {
++	target grpc.ServiceRegistrar
++}
++
++func (r registrar) RegisterService(registration servicev0.Registration) {
++	Register(r.target, registration)
++}
++
++// NewInvoker adapts a gRPC client connection to a transport-neutral invoker.
++func NewInvoker(conn grpc.ClientConnInterface) servicev0.Invoker {
++	return invoker{conn: conn}
++}
++
++type invoker struct {
++	conn grpc.ClientConnInterface
++}
++
++func (i invoker) Invoke(ctx context.Context, service, method string, request, response any) error {
++	return i.conn.Invoke(ctx, "/"+service+"/"+method, request, response, grpc.StaticMethod())
++}
++
++type serviceServer interface{}
++
++type server struct{}
++
++func unaryHandler(service string, method *servicev0.Method) grpc.MethodHandler {
++	return func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
++		request := method.NewRequest()
++		if err := dec(request); err != nil {
++			return nil, err
++		}
++		server := srv.(*server)
++		if interceptor == nil {
++			return method.Handler(ctx, request)
++		}
++		info := &grpc.UnaryServerInfo{Server: server, FullMethod: "/" + service + "/" + method.Name}
++		return interceptor(ctx, request, info, func(ctx context.Context, request any) (any, error) {
++			return method.Handler(ctx, request)
++		})
++	}
++}
+diff --git internal/extensions/servicegrpc/servicegrpc_test.go internal/extensions/servicegrpc/servicegrpc_test.go
+new file mode 100644
+index 0000000000..e0af7e9cf3
+--- /dev/null
++++ internal/extensions/servicegrpc/servicegrpc_test.go
+@@ -0,0 +1,44 @@
++package servicegrpc
++
++import (
++	"context"
++	"net"
++	"testing"
++
++	servicev0 "github.com/moby/moby/v2/extpoints/service/v0"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++	"gotest.tools/v3/assert"
++)
++
++func TestAdaptPreservesUnaryInterceptor(t *testing.T) {
++	intercepted := false
++	srv := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		intercepted = true
++		assert.Equal(t, info.FullMethod, "/example.Greeter/Greet")
++		return handler(ctx, req)
++	}))
++	Register(srv, servicev0.Registration{Service: "example.Greeter", Methods: []servicev0.Method{{
++		Name:       "Greet",
++		NewRequest: func() any { return new(wrapperspb.StringValue) },
++		Handler: func(_ context.Context, req any) (any, error) {
++			return wrapperspb.String("hello " + req.(*wrapperspb.StringValue).Value), nil
++		},
++	}}})
++
++	lis, err := net.Listen("tcp", "127.0.0.1:0")
++	assert.NilError(t, err)
++	go func() { _ = srv.Serve(lis) }()
++	t.Cleanup(srv.Stop)
++
++	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
++	assert.NilError(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++
++	out := new(wrapperspb.StringValue)
++	err = NewInvoker(conn).Invoke(context.Background(), "example.Greeter", "Greet", wrapperspb.String("world"), out)
++	assert.NilError(t, err)
++	assert.Equal(t, out.Value, "hello world")
++	assert.Check(t, intercepted)
++}
+
