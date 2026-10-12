@@ -189,6 +189,9 @@ func WithReservedServices(services ...string) Option {
 }
 
 // WithExtensionConfig sets configuration keyed by extension id.
+// A key with the version replaced by ".v*", such as org.example.myext.v*,
+// applies to every version of that extension; a key with the full id takes
+// precedence. See extensions.LookupConfig.
 // The outer map is copied when this option is created, while configuration
 // values are shared.
 func WithExtensionConfig(config map[extensions.ExtensionID]extensions.Config) Option {

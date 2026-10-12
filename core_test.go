@@ -112,6 +112,64 @@ func TestValidateExtensionID(t *testing.T) {
 	}
 }
 
+func TestValidateExtensionConfigKey(t *testing.T) {
+	valid := []ExtensionID{
+		"org.example.myext.v1",
+		"org.example.myext.v*",
+		"org.example.s3-volume.v*",
+		"org.example.v*",
+	}
+	for _, key := range valid {
+		if err := ValidateExtensionConfigKey(key); err != nil {
+			t.Errorf("ValidateExtensionConfigKey(%q) = %v, want nil", key, err)
+		}
+	}
+
+	invalid := []ExtensionID{
+		"",
+		".v*",                   // no name
+		"foo.v*",                // only one name segment
+		"org.example.myext",     // missing version
+		"org.example.myext.*",   // wildcard must be ".v*"
+		"org.example.myext.v",   // missing version number
+		"org.example.myext.v1*", // wildcard after a version
+		"org.example.*.v1",      // wildcard in a name segment
+		"Org.Example.myext.v*",  // uppercase
+		"org.example/evil.v*",   // path separator
+	}
+	for _, key := range invalid {
+		if err := ValidateExtensionConfigKey(key); err == nil {
+			t.Errorf("ValidateExtensionConfigKey(%q) = nil, want error", key)
+		}
+	}
+}
+
+func TestLookupConfig(t *testing.T) {
+	exact := Config{"source": "exact"}
+	anyVersion := Config{"source": "any version"}
+	configs := map[ExtensionID]Config{
+		"org.example.foo.v1": exact,
+		"org.example.foo.v*": anyVersion,
+		"org.example.bar.v1": {"source": "bar"},
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   ExtensionID
+		want Config
+	}{
+		{name: "exact id takes precedence", id: "org.example.foo.v1", want: exact},
+		{name: "any-version key covers other versions", id: "org.example.foo.v2", want: anyVersion},
+		{name: "other extension without a key", id: "org.example.baz.v1", want: nil},
+		{name: "exact key does not cover other versions", id: "org.example.bar.v2", want: nil},
+		{name: "name prefix does not match", id: "org.example.foobar.v1", want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.DeepEqual(t, LookupConfig(configs, tc.id), tc.want)
+		})
+	}
+}
+
 func TestValidateExtensionIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

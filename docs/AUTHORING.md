@@ -331,7 +331,7 @@ func (b *Bridge) Declaration() extensions.Declaration {
 ```
 
 `Init` receives the extension config and a resolver.
-The application supplies config keyed by id through `host.WithExtensionConfig`; declare dependencies and conflicts in the declaration.
+The application supplies config keyed by id, or by a `.v*` key for every version, through `host.WithExtensionConfig`; declare dependencies and conflicts in the declaration.
 The broker initializes dependencies before dependents.
 
 ### Retain dependencies for later calls
@@ -423,11 +423,16 @@ Configure extensions when constructing the Host:
 ```go
 host.WithExtensionConfig(map[extensions.ExtensionID]extensions.Config{
 	"com.example.myext.v1": {"some_key": "value"},
+	"com.example.other.v*": {"some_key": "value"},
 }),
 ```
 
 The same entry reaches an in-process `Init` or a separate binary through the startup handshake.
+A key with the version replaced by `.v*`, such as `com.example.other.v*`, applies to every version of that extension.
+A key with the full id, such as `com.example.other.v2`, takes precedence over it.
+Because each version is a separate extension, a `.v*` entry must suit the configuration format of every version it reaches.
 The application chooses how to read and validate this configuration; the framework does not read `daemon.json`.
+The Host does not validate keys and silently ignores one that matches no extension; check their format with `extensions.ValidateExtensionConfigKey`.
 
 ### Run in-process
 
@@ -519,7 +524,7 @@ See the [lifecycle limitations](./DESIGN.md#resolution-ordering-and-lifecycle).
 - Discover binaries with `host.WithDirs` and provide socket storage with `host.WithRuntimeDir`.
 - Wire internal calls to binaries with `host.WithClientProviders`.
 - Wire calls from binaries to Host providers with `host.WithDependencyProviders` and SDK `Server.Depends`.
-- Supply configuration by extension id with `host.WithExtensionConfig`.
+- Supply configuration by extension id, or by a `.v*` key for every version, with `host.WithExtensionConfig`.
 - Resolve Points through the Host and call their contract helpers.
 - Restrict internal providers with `host.WithProviderPolicy` using ordinary Point IDs.
 - Offer implemented Points with `servicev0.Offer`, authorize publication through policy on `servicev0.Point.ID()`, and supply `host.WithPointServers` for in-process offers.

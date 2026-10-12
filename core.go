@@ -112,11 +112,22 @@ func ValidatePointID(id PointID) error {
 	return nil
 }
 
+// extensionNamePattern is a lowercase reverse-DNS name: an extension id without
+// its version suffix.
+const extensionNamePattern = `[a-z0-9]+(-[a-z0-9]+)*(\.[a-z0-9]+(-[a-z0-9]+)*)+`
+
 // extensionIDPattern requires a lowercase reverse-DNS name with a mandatory vN
 // version. The version is a namespace element, not a semantic version: changing
-// com.foo.v1 to com.foo.v2 creates a new extension, binary, and configuration.
+// com.foo.v1 to com.foo.v2 creates a new extension and binary.
 // The restricted characters also make the id safe as a config key and filename.
-var extensionIDPattern = lazyRegexp(`^[a-z0-9]+(-[a-z0-9]+)*(\.[a-z0-9]+(-[a-z0-9]+)*)+\.v[0-9]+$`)
+var extensionIDPattern = lazyRegexp(`^` + extensionNamePattern + `\.v[0-9]+$`)
+
+// extensionNameOnlyPattern matches an extension id without its version.
+var extensionNameOnlyPattern = lazyRegexp(`^` + extensionNamePattern + `$`)
+
+// anyVersionSuffix replaces the ".vN" version of an extension id in a
+// configuration key that applies to every version of that extension.
+const anyVersionSuffix = ".v*"
 
 // ValidateExtensionID reports whether id is well-formed before it is used as a
 // configuration key or binary name.
@@ -126,6 +137,22 @@ func ValidateExtensionID(id ExtensionID) error {
 	}
 	if !extensionIDPattern().MatchString(string(id)) {
 		return fmt.Errorf("invalid extension id %q: want a versioned reverse-DNS name like org.example.myext.v1, lowercase, no path-hostile characters", id)
+	}
+	return nil
+}
+
+// ValidateExtensionConfigKey reports whether key can key extension
+// configuration.
+// A key is either a full extension id such as org.example.myext.v1, or an
+// extension id with its version replaced by ".v*", such as org.example.myext.v*,
+// which applies to every version of that extension.
+func ValidateExtensionConfigKey(key ExtensionID) error {
+	valid := extensionIDPattern().MatchString(string(key))
+	if name, ok := strings.CutSuffix(string(key), anyVersionSuffix); ok {
+		valid = extensionNameOnlyPattern().MatchString(name)
+	}
+	if !valid {
+		return fmt.Errorf("invalid extension config key %q: want an extension id like org.example.myext.v1, or org.example.myext.v* for any version", key)
 	}
 	return nil
 }
@@ -309,6 +336,20 @@ func RegisterAll(registrar Registrar, exts ...Extension) error {
 // Config is parsed per-extension configuration delivered by id to Init or the
 // out-of-process startup handshake.
 type Config = map[string]any
+
+// LookupConfig returns the configuration for extension id from configs.
+// An entry keyed by id takes precedence over one keyed by id with its version
+// replaced by ".v*".
+func LookupConfig(configs map[ExtensionID]Config, id ExtensionID) Config {
+	if config, ok := configs[id]; ok {
+		return config
+	}
+	i := strings.LastIndexByte(string(id), '.')
+	if i < 0 {
+		return nil
+	}
+	return configs[id[:i]+anyVersionSuffix]
+}
 
 // Extension is a host-managed extension declaration.
 type Extension interface {
