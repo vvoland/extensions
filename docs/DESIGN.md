@@ -126,7 +126,6 @@ additional cleanup.
 An extension is reachable through daemon-internal point calls, or through the
 generated gRPC service of an ordinary Point that it explicitly publishes.
 Publication does not require the daemon to import the extension's proto.
-Arbitrary raw gRPC publication is not supported.
 
 ### Generated Point publication
 
@@ -194,6 +193,11 @@ The extension must provide the shared publication point before publishing its
 service inventory. A name cannot collide with another extension or a service
 already served by the daemon; collision fails startup rather than shadowing the
 existing service.
+
+The Host does not require a published service to be named `<PointID>.<Service>`.
+Which services a Point carries is part of its contract, not something the framework enforces.
+It is up to Host policy to reject Points that publish services outside their proto package.
+
 
 The embedding application chooses the gRPC endpoint used for publication; the framework does not create a Docker API endpoint.
 An exposed service must enforce any access control it needs.

@@ -101,6 +101,7 @@ func Services(in []sdkapi.ProviderServices) map[extensions.PointID][]string {
 
 // ValidateServices rejects services listed under a point the extension did not
 // declare it provides.
+// It deliberately does not reject names outside the point's proto package.
 func ValidateServices(name string, points []extensions.PointID, services map[extensions.PointID][]string) error {
 	declared := make(map[extensions.PointID]bool, len(points))
 	for _, point := range points {
