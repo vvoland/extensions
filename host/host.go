@@ -279,6 +279,26 @@ func (h *Host) PublishedServicesForPoint(point extensions.PointID) map[extension
 	return out
 }
 
+// PublishedServices returns service names approved for external publication
+// under any offered Point, by extension.
+// In-process extensions are included; they have no [Host.Conn].
+func (h *Host) PublishedServices() map[extensions.ExtensionID][]string {
+	out := make(map[extensions.ExtensionID][]string, len(h.publishedServices))
+	for id, points := range h.publishedServices {
+		var names []string
+		for _, services := range points {
+			names = append(names, services...)
+		}
+
+		if len(names) > 0 {
+			slices.Sort(names)
+			out[id] = names
+		}
+	}
+
+	return out
+}
+
 // RegisterInProcessServices installs all policy-approved in-process Point
 // services on registrar.
 func (h *Host) RegisterInProcessServices(registrar grpc.ServiceRegistrar) {

@@ -231,3 +231,96 @@ func TestInProcessPointExposure(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, resp.Message, "hello world")
 }
+
+type multiGreeter struct{}
+
+func (multiGreeter) Greet(_ context.Context, req *greeterv0.HelloRequest) (*greeterv0.HelloReply, error) {
+	return &greeterv0.HelloReply{Message: "hello " + req.Name}, nil
+}
+
+type multiEcho struct{}
+
+func (multiEcho) Echo(_ context.Context, req *echov1.EchoRequest) (*echov1.EchoResponse, error) {
+	return &echov1.EchoResponse{Message: req.Message}, nil
+}
+
+// TestPublishedServicesCoversAllOfferedPoints verifies an extension offering
+// several Points is reported with every published service, not only those of
+// a single Point.
+func TestPublishedServicesCoversAllOfferedPoints(t *testing.T) {
+	ctx := t.Context()
+
+	const id = "org.example.multi.v1"
+
+	ext := extensions.New(extensions.Declaration{
+		ID: id,
+		Providers: []extensions.Provider{
+			greeterv0.Point.Provide(multiGreeter{}),
+			echov1.Point.Provide(multiEcho{}),
+			servicev0.Offer(greeterv0.Point, echov1.Point),
+		},
+	})
+	h, err := host.New(ctx,
+		host.WithRuntimeDir(shortTempDir(t)),
+		host.WithExtensions(ext),
+		host.WithPointServers(greeterpb.ServerPoint, echopb.ServerPoint),
+		host.WithProviderPolicy(host.PointPolicyFunc(func(extensions.ExtensionIdentity, extensions.PointID) host.PointPolicyResult {
+			return host.Allow()
+		})),
+	)
+
+	assert.NilError(t, err)
+	defer func() { assert.NilError(t, h.Shutdown(context.WithoutCancel(ctx))) }()
+
+	assert.DeepEqual(t, h.PublishedServices(), map[extensions.ExtensionID][]string{
+		id: {
+			"moby.extensions.internal.launcher.echo.v1.Echo",
+			"org.mobyproject.extension.example.greeter.v0.Greeter",
+		},
+	})
+}
+
+// TestPublishedServicesCoversBuiltinAndProcessExtensions verifies builtin and
+// launched extensions are both reported, and only launched ones are reachable
+// through a connection.
+func TestPublishedServicesCoversBuiltinAndProcessExtensions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and launches a helper binary")
+	}
+
+	dir := t.TempDir()
+
+	const processID = "org.example.exthook.v1"
+
+	bin := extensionBinaryPath(dir, processID)
+
+	build := exec.Command("go", "build", "-o", bin, "github.com/moby/extensions/internal/launcher/testdata/exthook")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build exthook extension: %v\n%s", err, out)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	h, err := host.New(ctx,
+		host.WithRuntimeDir(shortTempDir(t)),
+		host.WithDirs(dir),
+		host.WithExtensions(greeter.Extension),
+		host.WithPointServers(greeterpb.ServerPoint),
+		host.WithProviderPolicy(host.PointPolicyFunc(func(extensions.ExtensionIdentity, extensions.PointID) host.PointPolicyResult {
+			return host.Allow()
+		})),
+	)
+
+	assert.NilError(t, err)
+	defer func() { assert.NilError(t, h.Shutdown(context.WithoutCancel(ctx))) }()
+
+	assert.DeepEqual(t, h.PublishedServices(), map[extensions.ExtensionID][]string{
+		greeter.ID: {"org.mobyproject.extension.example.greeter.v0.Greeter"},
+		processID:  {"moby.extensions.internal.launcher.echo.v1.Echo"},
+	})
+	_, ok := h.Conn(processID)
+	assert.Check(t, ok)
+	_, ok = h.Conn(greeter.ID)
+	assert.Check(t, !ok)
+}
